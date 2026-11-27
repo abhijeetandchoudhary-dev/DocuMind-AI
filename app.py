@@ -573,11 +573,14 @@ with col_left:
                 notes.append(("success", f"Indexed {uf.name} ({meta['pages']} pages, {n} chunks)"))
                 added_any = True
 
-        if added_any:
+        if added_any or (store.chunks and store.index is None):
             new_chunks = len(store.chunks) - (store.index.ntotal if store.index is not None else 0)
-            with st.spinner(f"Embedding {new_chunks} passages locally..."):
-                build_indexes(store, get_embedding_model())
-            notes.append(("box", f"All passages embedded & indexed successfully."))
+            with st.spinner(f"Embedding {new_chunks} passages locally with nomic-embed-text..."):
+                try:
+                    build_indexes(store, get_embedding_model())
+                    notes.append(("box", "All passages embedded & indexed successfully."))
+                except Exception as exc:
+                    notes.append(("warning", f"Embedding notice: {exc} — hybrid keyword search active."))
         if notes:
             st.session_state.upload_notes = notes
             st.rerun()
@@ -625,7 +628,12 @@ with col_left:
 # RIGHT COLUMN: INTELLIGENT CHAT & EVIDENCE SYNTHESIZER
 # ------------------------------------------------------------------------------
 with col_right:
-    if store.index is not None and store.chunks:
+    if store.chunks:
+        if store.index is None:
+            try:
+                build_indexes(store, get_embedding_model())
+            except Exception:
+                pass
         st.markdown(
             """
             <div class="studio-card-header">

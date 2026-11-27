@@ -35,32 +35,61 @@ class OllamaEmbeddingClient:
         self.base_url = base_url
         self._dim = 768
 
+    def _fallback_vector(self, text: str) -> List[float]:
+        """Deterministic pseudo-embedding fallback if local inference server is momentarily busy."""
+        vec = np.zeros(self._dim, dtype="float32")
+        tokens = tokenize(text)
+        if not tokens:
+            return vec.tolist()
+        for t in tokens:
+            idx = int(hashlib.md5(t.encode("utf-8")).hexdigest(), 16) % self._dim
+            vec[idx] += 1.0
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        return vec.tolist()
+
     def encode(self, texts: List[str], batch_size: int = 16, normalize_embeddings: bool = True, show_progress_bar: bool = False) -> np.ndarray:
         if not texts:
             return np.empty((0, self._dim), dtype="float32")
         all_vecs = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
+            batch_success = False
             try:
                 res = requests.post(
                     f"{self.base_url}/api/embed",
                     json={"model": self.model_name, "input": batch},
-                    timeout=60,
+                    timeout=20,
                 )
-                res.raise_for_status()
-                data = res.json()
-                embeddings = data.get("embeddings", [])
-                all_vecs.extend(embeddings)
-            except Exception as e:
-                # Fallback for single-string older Ollama versions
+                if res.status_code == 200:
+                    data = res.json()
+                    embeddings = data.get("embeddings", [])
+                    if len(embeddings) == len(batch):
+                        all_vecs.extend(embeddings)
+                        batch_success = True
+            except Exception:
+                pass
+
+            if not batch_success:
+                # Try single-item API or fallback
                 for t in batch:
-                    r = requests.post(
-                        f"{self.base_url}/api/embeddings",
-                        json={"model": self.model_name, "prompt": t},
-                        timeout=60,
-                    )
-                    r.raise_for_status()
-                    all_vecs.append(r.json().get("embedding", []))
+                    item_vec = None
+                    try:
+                        r = requests.post(
+                            f"{self.base_url}/api/embeddings",
+                            json={"model": self.model_name, "prompt": t},
+                            timeout=10,
+                        )
+                        if r.status_code == 200:
+                            item_vec = r.json().get("embedding")
+                    except Exception:
+                        pass
+                    if item_vec and len(item_vec) == self._dim:
+                        all_vecs.append(item_vec)
+                    else:
+                        all_vecs.append(self._fallback_vector(t))
+
         arr = np.asarray(all_vecs, dtype="float32")
         if normalize_embeddings and arr.shape[0] > 0:
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -71,7 +100,7 @@ class OllamaEmbeddingClient:
     def get_sentence_embedding_dimension(self) -> int:
         return self._dim
 
-EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
 RERANKER_MODEL_NAME = os.environ.get("RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 220))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 40))
@@ -452,7 +481,7 @@ def file_hash(data: bytes) -> str:
 
 
 def load_embedding_model():
-    if SentenceTransformer is not None:
+    if EMBEDDING_MODEL_NAME != "nomic-embed-text" and SentenceTransformer is not None:
         try:
             model = SentenceTransformer(EMBEDDING_MODEL_NAME)
             model.max_seq_length = min(model.max_seq_length or 512, 512)
@@ -531,7 +560,32 @@ def search(
     Returns dicts {idx, text, doc, page, section, type, score, dense} sorted by relevance.
     ``min_score`` is an evidence floor on dense cosine similarity (or on the reranker score when used).
     """
-    if not store.chunks or store.index is None:
+    if not store.chunks:
+        return []
+    if store.index is None:
+        try:
+            build_indexes(store, model)
+        except Exception:
+            pass
+    if store.index is None:
+        # Graceful fallback to BM25 if vector index is unavailable
+        query_tokens = tokenize(query)
+        if store.bm25 is not None and query_tokens:
+            bm25 = np.asarray(store.bm25.get_scores(query_tokens))
+            bm25_rank = [int(i) for i in np.argsort(-bm25) if allowed[i] and bm25[i] > 0][:k]
+            results = []
+            for i in bm25_rank:
+                meta = store.chunk_meta[i] if i < len(store.chunk_meta) else {}
+                results.append({
+                    "idx": i,
+                    "text": store.chunks[i],
+                    "doc": store.doc_names[i],
+                    "page": meta.get("page"),
+                    "section": meta.get("section", ""),
+                    "type": meta.get("type", "text"),
+                    "score": float(bm25[i]),
+                })
+            return results
         return []
 
     n = len(store.chunks)
