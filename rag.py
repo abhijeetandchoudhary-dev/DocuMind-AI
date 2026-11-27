@@ -19,8 +19,57 @@ from typing import List, Optional, Tuple
 import faiss
 import numpy as np
 import pymupdf
+import requests
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+
+try:
+    from sentence_transformers import CrossEncoder, SentenceTransformer
+except Exception:
+    CrossEncoder = None
+    SentenceTransformer = None
+
+class OllamaEmbeddingClient:
+    """Lightweight embedding client via local Ollama API to avoid torch DLL policies."""
+    def __init__(self, model_name: str = "nomic-embed-text", base_url: str = "http://localhost:11434"):
+        self.model_name = model_name
+        self.base_url = base_url
+        self._dim = 768
+
+    def encode(self, texts: List[str], batch_size: int = 16, normalize_embeddings: bool = True, show_progress_bar: bool = False) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self._dim), dtype="float32")
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            try:
+                res = requests.post(
+                    f"{self.base_url}/api/embed",
+                    json={"model": self.model_name, "input": batch},
+                    timeout=60,
+                )
+                res.raise_for_status()
+                data = res.json()
+                embeddings = data.get("embeddings", [])
+                all_vecs.extend(embeddings)
+            except Exception as e:
+                # Fallback for single-string older Ollama versions
+                for t in batch:
+                    r = requests.post(
+                        f"{self.base_url}/api/embeddings",
+                        json={"model": self.model_name, "prompt": t},
+                        timeout=60,
+                    )
+                    r.raise_for_status()
+                    all_vecs.append(r.json().get("embedding", []))
+        arr = np.asarray(all_vecs, dtype="float32")
+        if normalize_embeddings and arr.shape[0] > 0:
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            arr = arr / norms
+        return arr
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self._dim
 
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-m3")
 RERANKER_MODEL_NAME = os.environ.get("RERANKER_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
@@ -402,17 +451,27 @@ def file_hash(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-def load_embedding_model() -> SentenceTransformer:
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    model.max_seq_length = min(model.max_seq_length or 512, 512)  # chunks are ~220 words; caps CPU cost
-    return model
+def load_embedding_model():
+    if SentenceTransformer is not None:
+        try:
+            model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            model.max_seq_length = min(model.max_seq_length or 512, 512)
+            return model
+        except Exception:
+            pass
+    return OllamaEmbeddingClient(model_name="nomic-embed-text")
 
 
-def load_reranker() -> CrossEncoder:
-    return CrossEncoder(RERANKER_MODEL_NAME, max_length=512)
+def load_reranker():
+    if CrossEncoder is not None:
+        try:
+            return CrossEncoder(RERANKER_MODEL_NAME, max_length=512)
+        except Exception:
+            pass
+    return None
 
 
-def _embed(model: SentenceTransformer, texts: List[str]) -> np.ndarray:
+def _embed(model, texts: List[str]) -> np.ndarray:
     return np.asarray(
         model.encode(texts, batch_size=16, normalize_embeddings=True, show_progress_bar=False),
         dtype="float32",
